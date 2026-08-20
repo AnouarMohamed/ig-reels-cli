@@ -22,6 +22,11 @@ All notable changes to this project will be documented in this file.
 - chore: add .gitignore and empty .env file
 - feat: implement Phase 1 - Python auth daemon (IG client and UDS server)
 
+- feat(T-005): implement framed MessagePack codec
+  - create py-ig-gateway/protocol.py with encode_frame and decode_frame functions
+  - add tests for zero/oversize/truncated/invalid payload cases
+  - verified tests pass with sequential execution
+
 ## [0.1.0] - 2026-08-20
 ### Added
 - Initial repository skeleton per T-001
