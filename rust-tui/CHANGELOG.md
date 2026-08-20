@@ -1,6 +1,0 @@
-- feat(T-004): create shared configuration/path parser skeleton
-  - create rust-tui/src/config.rs with environment variable parsing and validation
-  - update rust-tui/src/main.rs to use Config and print configuration
-  - add tests for valid/default/invalid FPS, max cols, max rows, fallback aspect
-  - verified tests pass with sequential execution
-  - verified binary works with custom environment variables
