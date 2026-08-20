@@ -1,8 +1,6 @@
-import json
 import os
 from instagrapi import Client
 from instagrapi.exceptions import ChallengeRequired, CheckpointRequired, LoginRequired
-import msgpack
 
 class IGClient:
     def __init__(self, session_file="session.json"):
