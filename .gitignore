@@ -30,3 +30,4 @@ coverage.xml
 *.cover
 *.log
 .git
+rust-tui/target/

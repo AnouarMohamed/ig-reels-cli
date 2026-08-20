@@ -1,0 +1,7 @@
+[package]
+name = "rust-tui"
+version = "0.1.0"
+edition = "2021"
+
+# Dependencies will be added as needed by near-term tasks.
+# See docs/spec/14_CONFIGURATION_AND_DEPENDENCIES.md for conception baseline.
