@@ -1,4 +1,5 @@
 mod config;
+pub mod ipc;
 
 use config::Config;
 
