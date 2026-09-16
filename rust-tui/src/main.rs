@@ -1,7 +1,4 @@
-mod config;
-pub mod ipc;
-
-use config::Config;
+use rust_tui::config::Config;
 
 fn main() {
     let config = Config::from_env();

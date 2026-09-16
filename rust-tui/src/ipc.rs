@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_REQUEST_ID_LEN: usize = 64;
@@ -9,6 +12,9 @@ pub const MAX_VIDEO_URL_LEN: usize = 8192;
 pub const MAX_CAPTION_LEN: usize = 20000;
 pub const MAX_USERNAME_LEN: usize = 256;
 pub const MAX_PAYLOAD_SIZE: usize = 1_048_576; // 1 MiB
+
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DtoValidationError {
@@ -90,6 +96,57 @@ impl fmt::Display for IpcFrameError {
 
 impl std::error::Error for IpcFrameError {}
 
+#[derive(Debug)]
+pub enum IpcClientError {
+    ConnectTimeout,
+    RequestTimeout,
+    IoError(std::io::Error),
+    FrameError(IpcFrameError),
+    SerializationError(String),
+    ValidationError(DtoValidationError),
+    RequestIdMismatch { expected: String, actual: String },
+}
+
+impl fmt::Display for IpcClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectTimeout => write!(f, "connection to IPC gateway timed out (2s limit)"),
+            Self::RequestTimeout => write!(f, "IPC request/response timed out (30s limit)"),
+            Self::IoError(e) => write!(f, "IPC I/O error: {}", e),
+            Self::FrameError(e) => write!(f, "IPC frame error: {}", e),
+            Self::SerializationError(msg) => write!(f, "IPC serialization error: {}", msg),
+            Self::ValidationError(e) => write!(f, "IPC DTO validation error: {}", e),
+            Self::RequestIdMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "IPC request_id mismatch: expected '{}', got '{}'",
+                    expected, actual
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for IpcClientError {}
+
+impl From<std::io::Error> for IpcClientError {
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError(e)
+    }
+}
+
+impl From<IpcFrameError> for IpcClientError {
+    fn from(e: IpcFrameError) -> Self {
+        Self::FrameError(e)
+    }
+}
+
+impl From<DtoValidationError> for IpcClientError {
+    fn from(e: DtoValidationError) -> Self {
+        Self::ValidationError(e)
+    }
+}
+
 pub async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, IpcFrameError>
 where
     R: AsyncReadExt + Unpin,
@@ -143,6 +200,50 @@ where
         .map_err(|e| IpcFrameError::IoError(e.to_string()))?;
 
     Ok(())
+}
+
+pub async fn send_request(
+    socket_path: impl AsRef<std::path::Path>,
+    request: &Request,
+) -> Result<Response, IpcClientError> {
+    request.validate()?;
+
+    let socket_path = socket_path.as_ref();
+    let stream_fut = UnixStream::connect(socket_path);
+    let mut stream = match timeout(CONNECT_TIMEOUT, stream_fut).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(IpcClientError::IoError(e)),
+        Err(_) => return Err(IpcClientError::ConnectTimeout),
+    };
+
+    let exchange_fut = async {
+        let req_bytes = rmp_serde::to_vec_named(request)
+            .map_err(|e| IpcClientError::SerializationError(e.to_string()))?;
+
+        write_frame(&mut stream, &req_bytes).await?;
+        let resp_bytes = read_frame(&mut stream).await?;
+
+        let response: Response = rmp_serde::from_slice(&resp_bytes)
+            .map_err(|e| IpcClientError::SerializationError(e.to_string()))?;
+
+        response.validate()?;
+
+        if response.request_id != request.request_id {
+            return Err(IpcClientError::RequestIdMismatch {
+                expected: request.request_id.clone(),
+                actual: response.request_id,
+            });
+        }
+
+        let _ = stream.shutdown().await;
+
+        Ok(response)
+    };
+
+    match timeout(REQUEST_TIMEOUT, exchange_fut).await {
+        Ok(result) => result,
+        Err(_) => Err(IpcClientError::RequestTimeout),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,6 +431,7 @@ impl ReelDto {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use tokio::net::UnixListener;
 
     #[test]
     fn test_request_ping_serialize_deserialize() {
@@ -486,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frame_partial_header() {
-        let partial_header = vec![0u8, 0u8, 0u8]; // only 3 bytes
+        let partial_header = vec![0u8, 0u8, 0u8];
         let mut cursor = Cursor::new(partial_header);
         let res = read_frame(&mut cursor).await;
         assert_eq!(res, Err(IpcFrameError::ProtocolTruncated));
@@ -495,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_frame_truncated_payload() {
         let mut data = 10u32.to_be_bytes().to_vec();
-        data.extend_from_slice(b"short"); // only 5 bytes instead of 10
+        data.extend_from_slice(b"short");
         let mut cursor = Cursor::new(data);
         let res = read_frame(&mut cursor).await;
         assert_eq!(res, Err(IpcFrameError::ProtocolTruncated));
@@ -519,5 +621,75 @@ mod tests {
                 (MAX_PAYLOAD_SIZE + 1) as u32
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_send_request_mock_ping() {
+        let sock_path = format!("/tmp/test_ipc_ping_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = UnixListener::bind(&sock_path).expect("bind socket");
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req_bytes = read_frame(&mut stream).await.expect("read ping req");
+                let req: Request = rmp_serde::from_slice(&req_bytes).expect("decode req");
+
+                let resp = Response {
+                    protocol_version: 1,
+                    request_id: req.request_id,
+                    ok: true,
+                    result: Some(serde_json::json!({
+                        "service": "ig-gateway",
+                        "status": "ok"
+                    })),
+                    error: None,
+                };
+                let resp_bytes = rmp_serde::to_vec_named(&resp).expect("encode resp");
+                write_frame(&mut stream, &resp_bytes)
+                    .await
+                    .expect("write ping resp");
+            }
+        });
+
+        let req = Request::ping("req-ping-1");
+        let resp = send_request(&sock_path, &req).await.expect("send_request");
+
+        assert!(resp.ok);
+        assert_eq!(resp.request_id, "req-ping-1");
+        let res = resp.result.expect("ping result");
+        assert_eq!(res["service"], "ig-gateway");
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn test_send_request_id_mismatch() {
+        let sock_path = format!("/tmp/test_ipc_mismatch_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = UnixListener::bind(&sock_path).expect("bind socket");
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_frame(&mut stream).await;
+                let resp = Response {
+                    protocol_version: 1,
+                    request_id: "wrong_id".to_string(),
+                    ok: true,
+                    result: Some(serde_json::json!({})),
+                    error: None,
+                };
+                let resp_bytes = rmp_serde::to_vec_named(&resp).expect("encode resp");
+                let _ = write_frame(&mut stream, &resp_bytes).await;
+            }
+        });
+
+        let req = Request::ping("expected_id");
+        let res = send_request(&sock_path, &req).await;
+
+        assert!(matches!(res, Err(IpcClientError::RequestIdMismatch { .. })));
+
+        let _ = std::fs::remove_file(&sock_path);
     }
 }
