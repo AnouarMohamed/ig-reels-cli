@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_REQUEST_ID_LEN: usize = 64;
@@ -7,6 +8,7 @@ pub const MAX_REEL_ID_LEN: usize = 128;
 pub const MAX_VIDEO_URL_LEN: usize = 8192;
 pub const MAX_CAPTION_LEN: usize = 20000;
 pub const MAX_USERNAME_LEN: usize = 256;
+pub const MAX_PAYLOAD_SIZE: usize = 1_048_576; // 1 MiB
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DtoValidationError {
@@ -62,6 +64,86 @@ impl fmt::Display for DtoValidationError {
 }
 
 impl std::error::Error for DtoValidationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcFrameError {
+    InvalidPayloadLength(u32),
+    ProtocolTruncated,
+    IoError(String),
+}
+
+impl fmt::Display for IpcFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPayloadLength(len) => {
+                write!(
+                    f,
+                    "invalid payload length {}, must be 1-{}",
+                    len, MAX_PAYLOAD_SIZE
+                )
+            }
+            Self::ProtocolTruncated => write!(f, "protocol stream truncated before frame end"),
+            Self::IoError(msg) => write!(f, "IPC I/O error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for IpcFrameError {}
+
+pub async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, IpcFrameError>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut header = [0u8; 4];
+    match reader.read_exact(&mut header).await {
+        Ok(4) => {}
+        Ok(_) => return Err(IpcFrameError::ProtocolTruncated),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(IpcFrameError::ProtocolTruncated);
+        }
+        Err(e) => return Err(IpcFrameError::IoError(e.to_string())),
+    }
+
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > MAX_PAYLOAD_SIZE {
+        return Err(IpcFrameError::InvalidPayloadLength(length as u32));
+    }
+
+    let mut payload = vec![0u8; length];
+    match reader.read_exact(&mut payload).await {
+        Ok(_) => Ok(payload),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(IpcFrameError::ProtocolTruncated)
+        }
+        Err(e) => Err(IpcFrameError::IoError(e.to_string())),
+    }
+}
+
+pub async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<(), IpcFrameError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let length = payload.len();
+    if length == 0 || length > MAX_PAYLOAD_SIZE {
+        return Err(IpcFrameError::InvalidPayloadLength(length as u32));
+    }
+
+    let header = (length as u32).to_be_bytes();
+    writer
+        .write_all(&header)
+        .await
+        .map_err(|e| IpcFrameError::IoError(e.to_string()))?;
+    writer
+        .write_all(payload)
+        .await
+        .map_err(|e| IpcFrameError::IoError(e.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| IpcFrameError::IoError(e.to_string()))?;
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Request {
@@ -247,6 +329,7 @@ impl ReelDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn test_request_ping_serialize_deserialize() {
@@ -363,5 +446,78 @@ mod tests {
         let decoded: Response = rmp_serde::from_slice(&bytes).expect("deserialize response");
 
         assert_eq!(resp, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_frame_roundtrip() {
+        let payload = b"hello msgpack frame";
+        let mut buffer = Vec::new();
+
+        write_frame(&mut buffer, payload)
+            .await
+            .expect("write frame");
+        assert_eq!(buffer.len(), 4 + payload.len());
+
+        let mut cursor = Cursor::new(buffer);
+        let read_payload = read_frame(&mut cursor).await.expect("read frame");
+        assert_eq!(read_payload, payload);
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_zero_payload_len() {
+        let header_zero = 0u32.to_be_bytes().to_vec();
+        let mut cursor = Cursor::new(header_zero);
+        let res = read_frame(&mut cursor).await;
+        assert_eq!(res, Err(IpcFrameError::InvalidPayloadLength(0)));
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_oversize_payload_len() {
+        let oversize = (MAX_PAYLOAD_SIZE as u32 + 1).to_be_bytes().to_vec();
+        let mut cursor = Cursor::new(oversize);
+        let res = read_frame(&mut cursor).await;
+        assert_eq!(
+            res,
+            Err(IpcFrameError::InvalidPayloadLength(
+                MAX_PAYLOAD_SIZE as u32 + 1
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_partial_header() {
+        let partial_header = vec![0u8, 0u8, 0u8]; // only 3 bytes
+        let mut cursor = Cursor::new(partial_header);
+        let res = read_frame(&mut cursor).await;
+        assert_eq!(res, Err(IpcFrameError::ProtocolTruncated));
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_truncated_payload() {
+        let mut data = 10u32.to_be_bytes().to_vec();
+        data.extend_from_slice(b"short"); // only 5 bytes instead of 10
+        let mut cursor = Cursor::new(data);
+        let res = read_frame(&mut cursor).await;
+        assert_eq!(res, Err(IpcFrameError::ProtocolTruncated));
+    }
+
+    #[tokio::test]
+    async fn test_write_frame_zero_payload() {
+        let mut buffer = Vec::new();
+        let res = write_frame(&mut buffer, &[]).await;
+        assert_eq!(res, Err(IpcFrameError::InvalidPayloadLength(0)));
+    }
+
+    #[tokio::test]
+    async fn test_write_frame_oversize_payload() {
+        let mut buffer = Vec::new();
+        let huge_payload = vec![0u8; MAX_PAYLOAD_SIZE + 1];
+        let res = write_frame(&mut buffer, &huge_payload).await;
+        assert_eq!(
+            res,
+            Err(IpcFrameError::InvalidPayloadLength(
+                (MAX_PAYLOAD_SIZE + 1) as u32
+            ))
+        );
     }
 }
